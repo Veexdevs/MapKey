@@ -1,0 +1,425 @@
+# =============================================================================
+# MapKey — Compilação do APK via GitHub Actions
+# -----------------------------------------------------------------------------
+# O projeto Android completo vive dentro de "MapKey-Android-Project.zip", na
+# raiz do repositório. Este workflow:
+#
+#   1. extrai o zip EXATAMENTE como ele está — nenhum arquivo-fonte é criado,
+#      editado ou apagado (só diretórios vazios residuais do zip são removidos,
+#      pois não contêm código);
+#   2. instala JDK 17, Android SDK (platform 34 + build-tools 34.0.0) e o
+#      Gradle na MESMA versão declarada em gradle/wrapper/gradle-wrapper.properties;
+#   3. roda a build padrão do projeto (assembleDebug / assembleRelease);
+#   4. confere o sha256 de todas as fontes antes x depois da build, provando
+#      que o código não foi modificado pela compilação;
+#   5. publica os APKs como artefato do run — e como GitHub Release quando o
+#      gatilho for uma tag v*.
+#
+# Observação: o zip não inclui o binário "gradle/wrapper/gradle-wrapper.jar"
+# (isso está documentado no README do próprio projeto). Por isso a compilação
+# usa o Gradle instalado pela action oficial, na mesma versão 8.7 apontada pelo
+# wrapper — sem precisar gerar/alterar nenhum arquivo dentro do projeto.
+#
+# Assinatura do release (opcional): cadastre estes secrets no repositório para
+# que o APK release saia assinado e instalável:
+#   MAPKEY_KEYSTORE_BASE64  -> `base64 -w0 mapkey.jks`
+#   MAPKEY_KEYSTORE_PASSWORD
+#   MAPKEY_KEY_ALIAS
+#   MAPKEY_KEY_PASSWORD
+# Sem eles, o release é publicado sem assinatura (app-release-unsigned.apk) e o
+# APK de debug — já assinado com a chave de depuração — continua instalável.
+# =============================================================================
+
+name: Build APK
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'MapKey-Android-Project.zip'
+      - '.github/workflows/build-apk.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'MapKey-Android-Project.zip'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Qual APK gerar'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - debug
+          - release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT_ZIP: MapKey-Android-Project.zip
+  WORK_DIR: build-src
+  OUT_DIR: apk-out
+  ANDROID_COMPILE_SDK: '34'
+  ANDROID_BUILD_TOOLS: '34.0.0'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  build:
+    name: Compilar MapKey APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.collect.outputs.version }}
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------------------------------
+      - name: Extrair o projeto do zip (sem alterar o código)
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$PROJECT_ZIP" ]; then
+            echo "::error::Arquivo $PROJECT_ZIP não encontrado na raiz do repositório."
+            exit 1
+          fi
+
+          rm -rf "$WORK_DIR" "$OUT_DIR"
+          mkdir -p "$WORK_DIR"
+          unzip -q "$PROJECT_ZIP" -d "$WORK_DIR"
+
+          SETTINGS=$(find "$WORK_DIR" -maxdepth 6 -type f -name 'settings.gradle*' | head -n 1)
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Nenhum settings.gradle(.kts) encontrado dentro do zip."
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$SETTINGS")
+
+          # O zip traz diretórios VAZIOS com nomes literais de brace expansion
+          # (ex.: "res/{layout,values,drawable,...}"), resultado do ambiente em
+          # que o pacote foi gerado. Diretórios vazios não contêm código algum e
+          # nomes inválidos dentro de res/ quebram o AAPT2 — por isso eles são
+          # removidos aqui. Nenhum ARQUIVO do projeto é tocado.
+          find "$PROJECT_DIR" -depth -type d -empty -delete
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "::group::Projeto extraído em $PROJECT_DIR"
+          find "$PROJECT_DIR" -maxdepth 3 | sort
+          echo "::endgroup::"
+          echo "Arquivos-fonte: $(find "$PROJECT_DIR" -type f | wc -l)"
+
+      # -------------------------------------------------------------------------
+      - name: Descobrir a versão do Gradle declarada pelo projeto
+        id: gradle_info
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROPS="$PROJECT_DIR/gradle/wrapper/gradle-wrapper.properties"
+          VERSION=""
+          if [ -f "$PROPS" ]; then
+            URL=$(sed -n 's/^distributionUrl=//p' "$PROPS" | tr -d '\\')
+            VERSION=$(echo "$URL" | sed -E 's#.*gradle-([0-9]+(\.[0-9]+)*).*#\1#')
+          fi
+          if [ -z "$VERSION" ]; then
+            VERSION="8.7"
+            echo "::warning::Não foi possível ler a versão do wrapper; usando Gradle $VERSION."
+          fi
+          echo "Gradle exigido pelo projeto: $VERSION"
+          echo "gradle_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "GRADLE_PROJECT_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      # -------------------------------------------------------------------------
+      - name: Configurar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Configurar Gradle (com cache)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.gradle_info.outputs.gradle_version }}
+
+      # -------------------------------------------------------------------------
+      - name: Preparar Android SDK (platform 34 + build-tools 34.0.0)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ANDROID_HOME:-}" ]; then
+            export ANDROID_HOME="$HOME/android-sdk"
+            mkdir -p "$ANDROID_HOME"
+            echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          fi
+          echo "ANDROID_HOME=$ANDROID_HOME"
+
+          SDKMANAGER=""
+          for candidate in \
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "$ANDROID_HOME/tools/bin/sdkmanager" \
+            "$(command -v sdkmanager || true)"; do
+            if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+              SDKMANAGER="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::warning::sdkmanager ausente — baixando commandline-tools."
+            CMDLINE_ZIP="$RUNNER_TEMP/commandlinetools.zip"
+            curl -fsSL -o "$CMDLINE_ZIP" \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            unzip -q "$CMDLINE_ZIP" -d "$ANDROID_HOME/cmdline-tools"
+            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          yes 2>/dev/null | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-$ANDROID_COMPILE_SDK" \
+            "build-tools;$ANDROID_BUILD_TOOLS" > /dev/null || true
+
+          echo "::group::Pacotes instalados"
+          ls "$ANDROID_HOME/platforms" 2>/dev/null || true
+          ls "$ANDROID_HOME/build-tools" 2>/dev/null || true
+          echo "::endgroup::"
+
+      # -------------------------------------------------------------------------
+      - name: Registrar sha256 das fontes (antes da build)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          find . -type f \
+            -not -path './build/*' -not -path './app/build/*' -not -path './.gradle/*' \
+            -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/src-before.sha256"
+          echo "Arquivos verificados: $(wc -l < "$RUNNER_TEMP/src-before.sha256")"
+
+      # -------------------------------------------------------------------------
+      - name: Compilar APK (${{ github.event.inputs.variant || 'both' }})
+        shell: bash
+        env:
+          VARIANT_INPUT: ${{ github.event.inputs.variant }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          VARIANT="${VARIANT_INPUT:-both}"
+          case "$VARIANT" in
+            debug)   TASKS="assembleDebug" ;;
+            release) TASKS="assembleRelease" ;;
+            *)       TASKS="assembleDebug assembleRelease" ;;
+          esac
+
+          java -version
+          echo "Gradle: $(gradle --version | sed -n 's/^Gradle //p' | head -n 1)"
+          echo "Tarefas: $TASKS"
+          echo
+
+          # Build padrão do projeto, sem nenhum parâmetro que altere o resultado
+          # (nada de -P, nada de arquivos gerados, nada de patch em build.gradle).
+          gradle $TASKS --console=plain --stacktrace
+
+      # -------------------------------------------------------------------------
+      - name: Conferir que as fontes NÃO foram modificadas
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          find . -type f \
+            -not -path './build/*' -not -path './app/build/*' -not -path './.gradle/*' \
+            -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/src-after.sha256"
+
+          if diff -u "$RUNNER_TEMP/src-before.sha256" "$RUNNER_TEMP/src-after.sha256"; then
+            echo "✅ Código-fonte idêntico ao do zip: nada foi modificado durante a build."
+          else
+            echo "::error::O código-fonte mudou durante a build — abortando."
+            exit 1
+          fi
+
+      # -------------------------------------------------------------------------
+      - name: Assinar o APK release (opcional, via secrets)
+        id: sign
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.MAPKEY_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.MAPKEY_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.MAPKEY_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.MAPKEY_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_DIR="$PROJECT_DIR/app/build/outputs/apk/release"
+          UNSIGNED=$(find "$RELEASE_DIR" -name '*unsigned*.apk' 2>/dev/null | head -n 1 || true)
+
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "Nenhum keystore nos secrets do repositório — release permanece sem assinatura."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$UNSIGNED" ]; then
+            echo "Nenhum APK release sem assinatura para assinar."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
+          KEYSTORE="$RUNNER_TEMP/mapkey-release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE"
+
+          ALIGNED="$RUNNER_TEMP/release-aligned.apk"
+          "$BUILD_TOOLS/zipalign" -f -p 4 "$UNSIGNED" "$ALIGNED"
+
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias "${KEY_ALIAS:?MAPKEY_KEY_ALIAS não configurado}" \
+            --ks-pass "pass:${KEYSTORE_PASSWORD:?MAPKEY_KEYSTORE_PASSWORD não configurado}" \
+            --key-pass "pass:${KEY_PASSWORD:-$KEYSTORE_PASSWORD}" \
+            --out "$UNSIGNED" \
+            "$ALIGNED"
+
+          "$BUILD_TOOLS/apksigner" verify --print-certs "$UNSIGNED"
+          rm -f "$KEYSTORE" "$ALIGNED"
+
+          # renomeia app-release-unsigned.apk -> app-release.apk (agora assinado)
+          mv "$UNSIGNED" "$RELEASE_DIR/app-release.apk"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          echo "✅ APK release assinado com o keystore dos secrets."
+
+      # -------------------------------------------------------------------------
+      - name: Coletar APKs, renomear e gerar checksums
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          VERSION=$(sed -n 's/.*versionName[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)
+          VERSION_CODE=$(sed -n 's/.*versionCode[[:space:]]*=[[:space:]]*\([0-9]\+\).*/\1/p' app/build.gradle.kts | head -n 1)
+          [ -n "$VERSION" ] || VERSION="0.0.0"
+          [ -n "$VERSION_CODE" ] || VERSION_CODE="0"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_ENV"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_ENV"
+
+          OUT="$GITHUB_WORKSPACE/$OUT_DIR"
+          mkdir -p "$OUT"
+
+          copy_apk() {
+            local src="$1" name="$2"
+            if [ -f "$src" ]; then
+              cp "$src" "$OUT/$name"
+              echo "  -> $name"
+            fi
+          }
+
+          echo "APKs gerados:"
+          copy_apk "app/build/outputs/apk/debug/app-debug.apk"     "MapKey-v${VERSION}-debug.apk"
+          copy_apk "app/build/outputs/apk/release/app-release.apk" "MapKey-v${VERSION}-release-signed.apk"
+          copy_apk "app/build/outputs/apk/release/app-release-unsigned.apk" "MapKey-v${VERSION}-release-unsigned.apk"
+
+          if [ -z "$(ls -A "$OUT" 2>/dev/null)" ]; then
+            echo "::error::Nenhum APK foi gerado pela build."
+            exit 1
+          fi
+
+          AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 -type f | sort -V | tail -n 1)
+          {
+            echo "# MapKey — resultado da build"
+            echo
+            echo "| APK | Tamanho | package / versionName | sha256 |"
+            echo "|---|---|---|---|"
+            for apk in "$OUT"/*.apk; do
+              base=$(basename "$apk")
+              size=$(du -h "$apk" | cut -f1)
+              sum=$(sha256sum "$apk" | cut -c1-16)
+              info=$("$AAPT2" dump badging "$apk" 2>/dev/null \
+                | sed -n "s/^package: name='\([^']*\)' versionCode='\([^']*\)' versionName='\([^']*\)'.*/\1 (\3, code \2)/p" \
+                | head -n 1)
+              echo "| \`$base\` | $size | \`${info:-?}\` | \`${sum}…\` |"
+            done
+          } > "$RUNNER_TEMP/apk-table.md"
+
+          ( cd "$OUT" && sha256sum *.apk > checksums.sha256 )
+          cat "$OUT/checksums.sha256"
+          cat "$RUNNER_TEMP/apk-table.md"
+
+      # -------------------------------------------------------------------------
+      - name: Resumo do job
+        shell: bash
+        run: |
+          {
+            cat "$RUNNER_TEMP/apk-table.md"
+            echo
+            echo "**Branch/commit:** \`${GITHUB_REF_NAME}\` @ \`${GITHUB_SHA::7}\`"
+            echo "**Código-fonte:** inalterado (sha256 conferido antes e depois da build)"
+            echo "**Gradle:** ${GRADLE_PROJECT_VERSION} · **compileSdk:** ${ANDROID_COMPILE_SDK} · **JDK:** 17"
+            echo
+            echo "### Como instalar"
+            echo "1. Baixe o artefato **MapKey-APKs** desta execução (abaixo, em *Artifacts*)."
+            echo "2. Use \`MapKey-v${VERSION}-debug.apk\` — já vem assinado com a chave de depuração e instala direto no celular."
+            echo "3. No Android, autorize \"instalar apps de fontes desconhecidas\" para o navegador/gerenciador de arquivos."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar artefato (MapKey-APKs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: MapKey-APKs
+          path: |
+            ${{ env.OUT_DIR }}/*.apk
+            ${{ env.OUT_DIR }}/checksums.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Em tags v* os APKs também viram um GitHub Release.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publicar GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Baixar artefato
+        uses: actions/download-artifact@v4
+        with:
+          name: MapKey-APKs
+          path: apks
+
+      - name: Criar/atualizar release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          ls -lh apks
+          NOTES="APKs do MapKey ${VERSION} compilados automaticamente pelo workflow *Build APK*.
+
+          - \`debug\`: assinado com chave de depuração — instala direto no celular.
+          - \`release\`: para distribuição (assinado se houver keystore nos secrets).
+
+          Código-fonte idêntico ao \`MapKey-Android-Project.zip\` do commit ${GITHUB_SHA}."
+          gh release create "$TAG" apks/*.apk apks/checksums.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "MapKey ${VERSION}" \
+            --notes "$NOTES" \
+            || gh release upload "$TAG" apks/*.apk apks/checksums.sha256 \
+                 --repo "$GITHUB_REPOSITORY" --clobber
