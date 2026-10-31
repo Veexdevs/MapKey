@@ -15,6 +15,14 @@
 #   5. publica os APKs como artefato do run — e como GitHub Release quando o
 #      gatilho for uma tag v*.
 #
+# Patch mínimo da CI: o themes.xml do zip declara "MapKeyText.Title",
+# "MapKeyText.Subtitle" e "MapKeyText.SectionLabel" sem atributo parent, então o
+# AAPT2 procura o estilo base "MapKeyText" — que não existe no projeto — e a
+# build morre em "resource style/MapKeyText not found". Como o combinado é não
+# mexer no seu código, o estilo base vazio é adicionado apenas na cópia de
+# trabalho por .github/android-ci-patches/ (zero impacto visual; nenhum arquivo
+# do zip é alterado e o sha256 de todos eles é conferido depois da build).
+#
 # Observação: o zip não inclui o binário "gradle/wrapper/gradle-wrapper.jar"
 # (isso está documentado no README do próprio projeto). Por isso a compilação
 # usa o Gradle instalado pela action oficial, na mesma versão 8.7 apontada pelo
@@ -35,14 +43,9 @@ name: Build APK
 on:
   push:
     branches: ['**']
-    paths:
-      - 'MapKey-Android-Project.zip'
-      - '.github/workflows/build-apk.yml'
+    tags: ['v*']
   pull_request:
     branches: [main]
-    paths:
-      - 'MapKey-Android-Project.zip'
-      - '.github/workflows/build-apk.yml'
   workflow_dispatch:
     inputs:
       variant:
@@ -75,6 +78,8 @@ jobs:
     name: Compilar MapKey APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: write   # necessário só para publicar o log de falha como comentário no commit
     outputs:
       version: ${{ steps.collect.outputs.version }}
 
@@ -121,6 +126,72 @@ jobs:
           echo "Arquivos-fonte: $(find "$PROJECT_DIR" -type f | wc -l)"
 
       # -------------------------------------------------------------------------
+      # O zip original NÃO é alterado. Os arquivos de .github/android-ci-patches/
+      # são copiados apenas para a cópia de trabalho extraída acima, e somente
+      # quando o recurso ainda não existir no projeto (nunca sobrescreve nada e
+      # nunca gera recurso duplicado). Cada arquivo de patch explica em
+      # comentários por que ele é necessário.
+      # -------------------------------------------------------------------------
+      - name: Aplicar patches mínimos da CI (cópia de trabalho)
+        id: patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATCH_SRC="$GITHUB_WORKSPACE/.github/android-ci-patches"
+          if [ ! -d "$PATCH_SRC" ]; then
+            echo "Nenhum patch de CI definido no repositório."
+            echo "applied=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STAGE="$RUNNER_TEMP/ci-patch"
+          rm -rf "$STAGE"
+          cp -a "$PATCH_SRC" "$STAGE"
+
+          APPLIED=""
+          while IFS= read -r -d '' f; do
+            rel="${f#$STAGE/}"
+            target="$PROJECT_DIR/$rel"
+
+            if [ -e "$target" ]; then
+              echo "PULADO (arquivo já existe no projeto): $rel"
+              rm -f "$f"
+              continue
+            fi
+
+            # Se qualquer recurso declarado pelo patch já existir no projeto,
+            # descarta o patch inteiro (evita "duplicate resource" no AAPT2).
+            if [[ "$rel" == */values/*.xml ]]; then
+              # remove comentários XML antes, para não confundir documentação com declaração
+              names=$(perl -0777 -pe 's/<!--.*?-->//gs' "$f" \
+                        | grep -oE '<(style|color|string|dimen|bool|integer|item|plurals|string-array)[^>]*name="[^"]+"' \
+                        | sed -E 's/.*name="([^"]+)".*/\1/' | sort -u || true)
+              dup=""
+              for n in $names; do
+                if grep -rqE "name=\"$n\"" "$PROJECT_DIR/app/src/main/res" 2>/dev/null; then
+                  dup="$dup $n"
+                fi
+              done
+              if [ -n "$dup" ]; then
+                echo "PULADO (o projeto já define:$dup ): $rel"
+                rm -f "$f"
+                continue
+              fi
+            fi
+
+            mkdir -p "$(dirname "$target")"
+            cp "$f" "$target"
+            echo "APLICADO: $rel"
+            APPLIED="${APPLIED}${APPLIED:+, }$rel"
+          done < <(find "$STAGE" -type f -print0)
+
+          echo "applied=$APPLIED" >> "$GITHUB_OUTPUT"
+          echo "CI_PATCH_APPLIED=$APPLIED" >> "$GITHUB_ENV"
+          if [ -z "$APPLIED" ]; then
+            echo "Nenhum patch foi necessário — projeto compilado 100% como está no zip."
+          fi
+
+      # -------------------------------------------------------------------------
       - name: Descobrir a versão do Gradle declarada pelo projeto
         id: gradle_info
         shell: bash
@@ -161,8 +232,10 @@ jobs:
           if [ -z "${ANDROID_HOME:-}" ]; then
             export ANDROID_HOME="$HOME/android-sdk"
             mkdir -p "$ANDROID_HOME"
-            echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           fi
+          # exporta sempre, para os passos seguintes (Gradle incluso) enxergarem o SDK
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$ANDROID_HOME"
 
           SDKMANAGER=""
@@ -191,7 +264,8 @@ jobs:
           "$SDKMANAGER" --install \
             "platform-tools" \
             "platforms;android-$ANDROID_COMPILE_SDK" \
-            "build-tools;$ANDROID_BUILD_TOOLS" > /dev/null || true
+            "build-tools;$ANDROID_BUILD_TOOLS" 2>&1 | tail -n 15 || \
+            echo "::warning::sdkmanager --install retornou erro; seguindo com o que já existe no runner."
 
           echo "::group::Pacotes instalados"
           ls "$ANDROID_HOME/platforms" 2>/dev/null || true
@@ -211,11 +285,12 @@ jobs:
 
       # -------------------------------------------------------------------------
       - name: Compilar APK (${{ github.event.inputs.variant || 'both' }})
+        id: build
         shell: bash
         env:
           VARIANT_INPUT: ${{ github.event.inputs.variant }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           cd "$PROJECT_DIR"
 
           VARIANT="${VARIANT_INPUT:-both}"
@@ -225,14 +300,71 @@ jobs:
             *)       TASKS="assembleDebug assembleRelease" ;;
           esac
 
-          java -version
+          echo "== Ambiente =="
+          echo "JAVA_HOME=${JAVA_HOME:-<vazio>}"
+          java -version 2>&1 | head -n 1
+          echo "ANDROID_HOME=${ANDROID_HOME:-<vazio>}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<vazio>}"
+          ls "${ANDROID_HOME:-/nonexistent}/platforms" 2>/dev/null || echo "  (sem platforms)"
+          ls "${ANDROID_HOME:-/nonexistent}/build-tools" 2>/dev/null || echo "  (sem build-tools)"
+          command -v gradle || { echo "::error title=Build APK::Gradle não encontrado no PATH"; exit 127; }
           echo "Gradle: $(gradle --version | sed -n 's/^Gradle //p' | head -n 1)"
           echo "Tarefas: $TASKS"
           echo
 
           # Build padrão do projeto, sem nenhum parâmetro que altere o resultado
           # (nada de -P, nada de arquivos gerados, nada de patch em build.gradle).
-          gradle $TASKS --console=plain --stacktrace
+          LOG="$RUNNER_TEMP/gradle.log"
+          gradle $TASKS --console=plain --stacktrace 2>&1 | tee "$LOG"
+          STATUS=${PIPESTATUS[0]}
+
+          if [ "$STATUS" -ne 0 ]; then
+            echo
+            echo "==== A build falhou (exit $STATUS) — últimas 40 linhas como anotação ===="
+            tail -n 40 "$LOG" | grep -v '^[[:space:]]*$' | while IFS= read -r line; do
+              printf '::error title=Build APK::%s\n' "${line//%/%25}"
+            done
+            echo "----- últimas 200 linhas do log -----"
+            tail -n 200 "$LOG"
+            exit "$STATUS"
+          fi
+
+      # -------------------------------------------------------------------------
+      # Diagnóstico: em caso de falha, publica o log do Gradle como comentário no
+      # commit e como artefato, para não depender da página de logs do Actions.
+      # -------------------------------------------------------------------------
+      - name: Publicar log da falha (comentário no commit)
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/gradle.log"
+          [ -f "$LOG" ] || { echo "Nenhum log do Gradle foi gerado."; exit 0; }
+          BODY="$RUNNER_TEMP/fail-comment.md"
+          {
+            echo "### ❌ Build do APK falhou — log do Gradle (últimas 200 linhas)"
+            echo
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- Commit: \`${GITHUB_SHA::7}\` · Gradle \`${GRADLE_PROJECT_VERSION:-?}\` · JDK 17 · compileSdk ${ANDROID_COMPILE_SDK}"
+            echo
+            echo '```text'
+            tail -n 200 "$LOG"
+            echo '```'
+          } > "$BODY"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/comments" \
+            -F body=@"$BODY" --jq '.html_url' \
+            || echo "::warning::Não foi possível comentar o log no commit."
+
+      - name: Anexar log da build como artefato (em falha)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: ${{ runner.temp }}/gradle.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       # -------------------------------------------------------------------------
       - name: Conferir que as fontes NÃO foram modificadas
@@ -366,7 +498,12 @@ jobs:
             cat "$RUNNER_TEMP/apk-table.md"
             echo
             echo "**Branch/commit:** \`${GITHUB_REF_NAME}\` @ \`${GITHUB_SHA::7}\`"
-            echo "**Código-fonte:** inalterado (sha256 conferido antes e depois da build)"
+            echo "**Código-fonte do zip:** inalterado (sha256 conferido antes e depois da build)"
+            if [ -n "${CI_PATCH_APPLIED:-}" ]; then
+              echo "**Patches da CI aplicados na cópia de trabalho:** \`${CI_PATCH_APPLIED}\` (veja \`.github/android-ci-patches/\`)"
+            else
+              echo "**Patches da CI:** nenhum foi necessário"
+            fi
             echo "**Gradle:** ${GRADLE_PROJECT_VERSION} · **compileSdk:** ${ANDROID_COMPILE_SDK} · **JDK:** 17"
             echo
             echo "### Como instalar"

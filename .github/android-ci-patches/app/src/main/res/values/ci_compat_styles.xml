@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ============================================================================
+  ARQUIVO ADICIONADO SOMENTE PELO GITHUB ACTIONS (não faz parte do zip original)
+  ============================================================================
+
+  Por que existe:
+    Em app/src/main/res/values/themes.xml do MapKey-Android-Project.zip há três
+    estilos com notação de ponto e SEM o atributo parent:
+
+        <style name="MapKeyText.Title">        ...
+        <style name="MapKeyText.Subtitle">     ...
+        <style name="MapKeyText.SectionLabel"> ...
+
+    Nessa sintaxe o Android deriva o pai implicitamente a partir do nome, ou
+    seja, ele procura um estilo chamado "MapKeyText". Esse estilo base não foi
+    incluído no projeto, e o AAPT2 aborta a build com:
+
+        error: resource style/MapKeyText (aka com.higzent.mapkey:style/MapKeyText)
+        not found.
+        error: failed linking references.
+
+  O que este arquivo faz:
+    Declara apenas o estilo base vazio que falta. Ele NÃO define nenhum item,
+    portanto NÃO altera cor, tamanho, fonte ou qualquer aparência do aplicativo:
+    os três estilos filhos continuam exatamente com os atributos que já tinham.
+    É equivalente a escrever parent="" nos três, só que sem tocar no seu código.
+
+  Nenhum arquivo do MapKey-Android-Project.zip é modificado: este arquivo é
+  copiado para a cópia de trabalho extraída durante a build e some junto com
+  ela. A CI também confere o sha256 de todos os arquivos originais antes e
+  depois da compilação (veja o workflow .github/workflows/build-apk.yml).
+
+  Se um dia você declarar "MapKeyText" dentro do próprio projeto, o workflow
+  detecta e pula este patch automaticamente.
+-->
+<resources>
+    <style name="MapKeyText" />
+</resources>
