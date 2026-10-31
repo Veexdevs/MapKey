@@ -161,8 +161,10 @@ jobs:
           if [ -z "${ANDROID_HOME:-}" ]; then
             export ANDROID_HOME="$HOME/android-sdk"
             mkdir -p "$ANDROID_HOME"
-            echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           fi
+          # exporta sempre, para os passos seguintes (Gradle incluso) enxergarem o SDK
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=$ANDROID_HOME"
 
           SDKMANAGER=""
@@ -191,7 +193,8 @@ jobs:
           "$SDKMANAGER" --install \
             "platform-tools" \
             "platforms;android-$ANDROID_COMPILE_SDK" \
-            "build-tools;$ANDROID_BUILD_TOOLS" > /dev/null || true
+            "build-tools;$ANDROID_BUILD_TOOLS" 2>&1 | tail -n 15 || \
+            echo "::warning::sdkmanager --install retornou erro; seguindo com o que já existe no runner."
 
           echo "::group::Pacotes instalados"
           ls "$ANDROID_HOME/platforms" 2>/dev/null || true
@@ -215,7 +218,7 @@ jobs:
         env:
           VARIANT_INPUT: ${{ github.event.inputs.variant }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           cd "$PROJECT_DIR"
 
           VARIANT="${VARIANT_INPUT:-both}"
@@ -225,14 +228,36 @@ jobs:
             *)       TASKS="assembleDebug assembleRelease" ;;
           esac
 
-          java -version
+          echo "== Ambiente =="
+          echo "JAVA_HOME=${JAVA_HOME:-<vazio>}"
+          java -version 2>&1 | head -n 1
+          echo "ANDROID_HOME=${ANDROID_HOME:-<vazio>}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<vazio>}"
+          ls "${ANDROID_HOME:-/nonexistent}/platforms" 2>/dev/null || echo "  (sem platforms)"
+          ls "${ANDROID_HOME:-/nonexistent}/build-tools" 2>/dev/null || echo "  (sem build-tools)"
+          command -v gradle || { echo "::error title=Build APK::Gradle não encontrado no PATH"; exit 127; }
           echo "Gradle: $(gradle --version | sed -n 's/^Gradle //p' | head -n 1)"
           echo "Tarefas: $TASKS"
           echo
 
           # Build padrão do projeto, sem nenhum parâmetro que altere o resultado
           # (nada de -P, nada de arquivos gerados, nada de patch em build.gradle).
-          gradle $TASKS --console=plain --stacktrace
+          LOG="$RUNNER_TEMP/gradle.log"
+          gradle $TASKS --console=plain --stacktrace 2>&1 | tee "$LOG"
+          STATUS=${PIPESTATUS[0]}
+
+          if [ "$STATUS" -ne 0 ]; then
+            echo
+            echo "==== A build falhou (exit $STATUS) — trechos relevantes ===="
+            grep -E "^e: |FAILURE:|What went wrong|^> Task .* FAILED|Caused by:|Execution failed|error:|A problem occurred|SDK location|License for package|Could not (resolve|find|download)|Unsupported (class|major)|INSTALL_FAILED" "$LOG" \
+              | head -n 40 \
+              | while IFS= read -r line; do
+                  printf '::error title=Build APK::%s\n' "${line//%/%25}"
+                done
+            echo "----- últimas 80 linhas do log -----"
+            tail -n 80 "$LOG"
+            exit "$STATUS"
+          fi
 
       # -------------------------------------------------------------------------
       - name: Conferir que as fontes NÃO foram modificadas
