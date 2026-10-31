@@ -123,6 +123,72 @@ jobs:
           echo "Arquivos-fonte: $(find "$PROJECT_DIR" -type f | wc -l)"
 
       # -------------------------------------------------------------------------
+      # O zip original NÃO é alterado. Os arquivos de .github/android-ci-patches/
+      # são copiados apenas para a cópia de trabalho extraída acima, e somente
+      # quando o recurso ainda não existir no projeto (nunca sobrescreve nada e
+      # nunca gera recurso duplicado). Cada arquivo de patch explica em
+      # comentários por que ele é necessário.
+      # -------------------------------------------------------------------------
+      - name: Aplicar patches mínimos da CI (cópia de trabalho)
+        id: patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATCH_SRC="$GITHUB_WORKSPACE/.github/android-ci-patches"
+          if [ ! -d "$PATCH_SRC" ]; then
+            echo "Nenhum patch de CI definido no repositório."
+            echo "applied=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STAGE="$RUNNER_TEMP/ci-patch"
+          rm -rf "$STAGE"
+          cp -a "$PATCH_SRC" "$STAGE"
+
+          APPLIED=""
+          while IFS= read -r -d '' f; do
+            rel="${f#$STAGE/}"
+            target="$PROJECT_DIR/$rel"
+
+            if [ -e "$target" ]; then
+              echo "PULADO (arquivo já existe no projeto): $rel"
+              rm -f "$f"
+              continue
+            fi
+
+            # Se qualquer recurso declarado pelo patch já existir no projeto,
+            # descarta o patch inteiro (evita "duplicate resource" no AAPT2).
+            if [[ "$rel" == */values/*.xml ]]; then
+              # remove comentários XML antes, para não confundir documentação com declaração
+              names=$(perl -0777 -pe 's/<!--.*?-->//gs' "$f" \
+                        | grep -oE '<(style|color|string|dimen|bool|integer|item|plurals|string-array)[^>]*name="[^"]+"' \
+                        | sed -E 's/.*name="([^"]+)".*/\1/' | sort -u || true)
+              dup=""
+              for n in $names; do
+                if grep -rqE "name=\"$n\"" "$PROJECT_DIR/app/src/main/res" 2>/dev/null; then
+                  dup="$dup $n"
+                fi
+              done
+              if [ -n "$dup" ]; then
+                echo "PULADO (o projeto já define:$dup ): $rel"
+                rm -f "$f"
+                continue
+              fi
+            fi
+
+            mkdir -p "$(dirname "$target")"
+            cp "$f" "$target"
+            echo "APLICADO: $rel"
+            APPLIED="${APPLIED}${APPLIED:+, }$rel"
+          done < <(find "$STAGE" -type f -print0)
+
+          echo "applied=$APPLIED" >> "$GITHUB_OUTPUT"
+          echo "CI_PATCH_APPLIED=$APPLIED" >> "$GITHUB_ENV"
+          if [ -z "$APPLIED" ]; then
+            echo "Nenhum patch foi necessário — projeto compilado 100% como está no zip."
+          fi
+
+      # -------------------------------------------------------------------------
       - name: Descobrir a versão do Gradle declarada pelo projeto
         id: gradle_info
         shell: bash
@@ -429,7 +495,12 @@ jobs:
             cat "$RUNNER_TEMP/apk-table.md"
             echo
             echo "**Branch/commit:** \`${GITHUB_REF_NAME}\` @ \`${GITHUB_SHA::7}\`"
-            echo "**Código-fonte:** inalterado (sha256 conferido antes e depois da build)"
+            echo "**Código-fonte do zip:** inalterado (sha256 conferido antes e depois da build)"
+            if [ -n "${CI_PATCH_APPLIED:-}" ]; then
+              echo "**Patches da CI aplicados na cópia de trabalho:** \`${CI_PATCH_APPLIED}\` (veja \`.github/android-ci-patches/\`)"
+            else
+              echo "**Patches da CI:** nenhum foi necessário"
+            fi
             echo "**Gradle:** ${GRADLE_PROJECT_VERSION} · **compileSdk:** ${ANDROID_COMPILE_SDK} · **JDK:** 17"
             echo
             echo "### Como instalar"
