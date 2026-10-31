@@ -75,6 +75,8 @@ jobs:
     name: Compilar MapKey APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: write   # necessário só para publicar o log de falha como comentário no commit
     outputs:
       version: ${{ steps.collect.outputs.version }}
 
@@ -214,6 +216,7 @@ jobs:
 
       # -------------------------------------------------------------------------
       - name: Compilar APK (${{ github.event.inputs.variant || 'both' }})
+        id: build
         shell: bash
         env:
           VARIANT_INPUT: ${{ github.event.inputs.variant }}
@@ -248,16 +251,51 @@ jobs:
 
           if [ "$STATUS" -ne 0 ]; then
             echo
-            echo "==== A build falhou (exit $STATUS) — trechos relevantes ===="
-            grep -E "^e: |FAILURE:|What went wrong|^> Task .* FAILED|Caused by:|Execution failed|error:|A problem occurred|SDK location|License for package|Could not (resolve|find|download)|Unsupported (class|major)|INSTALL_FAILED" "$LOG" \
-              | head -n 40 \
-              | while IFS= read -r line; do
-                  printf '::error title=Build APK::%s\n' "${line//%/%25}"
-                done
-            echo "----- últimas 80 linhas do log -----"
-            tail -n 80 "$LOG"
+            echo "==== A build falhou (exit $STATUS) — últimas 40 linhas como anotação ===="
+            tail -n 40 "$LOG" | grep -v '^[[:space:]]*$' | while IFS= read -r line; do
+              printf '::error title=Build APK::%s\n' "${line//%/%25}"
+            done
+            echo "----- últimas 200 linhas do log -----"
+            tail -n 200 "$LOG"
             exit "$STATUS"
           fi
+
+      # -------------------------------------------------------------------------
+      # Diagnóstico: em caso de falha, publica o log do Gradle como comentário no
+      # commit e como artefato, para não depender da página de logs do Actions.
+      # -------------------------------------------------------------------------
+      - name: Publicar log da falha (comentário no commit)
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/gradle.log"
+          [ -f "$LOG" ] || { echo "Nenhum log do Gradle foi gerado."; exit 0; }
+          BODY="$RUNNER_TEMP/fail-comment.md"
+          {
+            echo "### ❌ Build do APK falhou — log do Gradle (últimas 200 linhas)"
+            echo
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- Commit: \`${GITHUB_SHA::7}\` · Gradle \`${GRADLE_PROJECT_VERSION:-?}\` · JDK 17 · compileSdk ${ANDROID_COMPILE_SDK}"
+            echo
+            echo '```text'
+            tail -n 200 "$LOG"
+            echo '```'
+          } > "$BODY"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/comments" \
+            -F body=@"$BODY" --jq '.html_url' \
+            || echo "::warning::Não foi possível comentar o log no commit."
+
+      - name: Anexar log da build como artefato (em falha)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: ${{ runner.temp }}/gradle.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       # -------------------------------------------------------------------------
       - name: Conferir que as fontes NÃO foram modificadas
