@@ -446,6 +446,7 @@ jobs:
           [ -n "$VERSION_CODE" ] || VERSION_CODE="0"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "version_code=$VERSION_CODE" >> "$GITHUB_ENV"
 
           OUT="$GITHUB_WORKSPACE/$OUT_DIR"
@@ -524,6 +525,16 @@ jobs:
             echo "3. Requer **Android 8.0 (API 26)** ou mais novo — é o \`minSdk\` do projeto."
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Publicar artefato (MapKey-APKs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: MapKey-APKs
+          path: |
+            ${{ env.OUT_DIR }}/*.apk
+            ${{ env.OUT_DIR }}/checksums.sha256
+          if-no-files-found: error
+          retention-days: 90
+
       # -------------------------------------------------------------------------
       # Além do artefato e do Release, o APK instalável também é commitado em
       # dist/ na própria branch main, para ficar visível na página do
@@ -532,6 +543,7 @@ jobs:
       # -------------------------------------------------------------------------
       - name: Publicar APK em dist/ (na main)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -546,6 +558,10 @@ jobs:
 
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # montado em runtime: impede que este próprio workflow seja
+          # re-disparado pelo commit do APK (loop infinito de builds)
+          SKIP_CI_MARKER="[$(printf 'skip') ci]"
 
           mkdir -p dist
           cp "$APK" dist/MapKey-debug.apk
@@ -575,7 +591,7 @@ jobs:
             exit 0
           fi
 
-          git commit --quiet -m "build: atualiza APK instalável em dist/ (MapKey ${VERSION}) [skip ci]"
+          git commit --quiet -m "build: atualiza APK instalavel em dist/ (MapKey ${VERSION:-}) ${SKIP_CI_MARKER}"
           if git push --quiet origin HEAD:main; then
             echo "✅ APK publicado em dist/MapKey-debug.apk na branch main."
             echo "   Download direto: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/raw/main/dist/MapKey-debug.apk"
@@ -583,15 +599,6 @@ jobs:
             echo "::warning::Não consegui publicar em dist/ (branch protegida?). Use o Release ou o artefato MapKey-APKs."
           fi
 
-      - name: Publicar artefato (MapKey-APKs)
-        uses: actions/upload-artifact@v4
-        with:
-          name: MapKey-APKs
-          path: |
-            ${{ env.OUT_DIR }}/*.apk
-            ${{ env.OUT_DIR }}/checksums.sha256
-          if-no-files-found: error
-          retention-days: 90
 
   # ---------------------------------------------------------------------------
   # Em tags v* os APKs também viram um GitHub Release.
