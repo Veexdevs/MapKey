@@ -548,15 +548,26 @@ jobs:
         run: |
           set -euo pipefail
           ls -lh apks
-          NOTES="APKs do MapKey ${VERSION} compilados automaticamente pelo workflow *Build APK*.
 
-          - \`debug\`: assinado com chave de depuração — instala direto no celular.
-          - \`release\`: para distribuição (assinado se houver keystore nos secrets).
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          cat > "$NOTES_FILE" <<EOF
+          APKs do MapKey ${VERSION} compilados automaticamente pelo workflow **Build APK**.
 
-          Código-fonte idêntico ao \`MapKey-Android-Project.zip\` do commit ${GITHUB_SHA}."
+          | Arquivo | Para que serve |
+          |---|---|
+          | \`MapKey-v${VERSION}-debug.apk\` | **Instale este.** Já vem assinado com a chave de depuração da build. |
+          | \`MapKey-v${VERSION}-release-unsigned.apk\` | Build release sem assinatura (só para distribuir depois de assinar). |
+          | \`checksums.sha256\` | SHA-256 de cada APK, para conferir a integridade do download. |
+
+          - Código-fonte: idêntico ao \`MapKey-Android-Project.zip\` (sha256 de todos os arquivos conferido antes e depois da build).
+          - Commit: \`${GITHUB_SHA}\`
+          - Log da compilação: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          sed -i 's/^          //' "$NOTES_FILE"
+
           gh release create "$TAG" apks/*.apk apks/checksums.sha256 \
             --repo "$GITHUB_REPOSITORY" \
             --title "MapKey ${VERSION}" \
-            --notes "$NOTES" \
+            --notes-file "$NOTES_FILE" \
             || gh release upload "$TAG" apks/*.apk apks/checksums.sha256 \
                  --repo "$GITHUB_REPOSITORY" --clobber
