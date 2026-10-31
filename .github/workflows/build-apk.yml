@@ -550,20 +550,28 @@ jobs:
           ls -lh apks
 
           NOTES_FILE="$RUNNER_TEMP/release-notes.md"
-          cat > "$NOTES_FILE" <<EOF
-          APKs do MapKey ${VERSION} compilados automaticamente pelo workflow **Build APK**.
-
-          | Arquivo | Para que serve |
-          |---|---|
-          | \`MapKey-v${VERSION}-debug.apk\` | **Instale este.** Já vem assinado com a chave de depuração da build. |
-          | \`MapKey-v${VERSION}-release-unsigned.apk\` | Build release sem assinatura (só para distribuir depois de assinar). |
-          | \`checksums.sha256\` | SHA-256 de cada APK, para conferir a integridade do download. |
-
-          - Código-fonte: idêntico ao \`MapKey-Android-Project.zip\` (sha256 de todos os arquivos conferido antes e depois da build).
-          - Commit: \`${GITHUB_SHA}\`
-          - Log da compilação: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
-          EOF
-          sed -i 's/^          //' "$NOTES_FILE"
+          {
+            echo "APKs do MapKey ${VERSION} compilados automaticamente pelo workflow **Build APK**."
+            echo
+            echo "| Arquivo | Para que serve |"
+            echo "|---|---|"
+            for f in apks/*.apk; do
+              b=$(basename "$f")
+              size=$(du -h "$f" | cut -f1)
+              case "$b" in
+                *debug*)            desc="**Instale este** — já vem assinado com a chave de depuração da build." ;;
+                *release-signed*)   desc="Build release assinada com o keystore cadastrado nos secrets." ;;
+                *release-unsigned*) desc="Build release sem assinatura — assine antes de distribuir." ;;
+                *)                  desc="APK gerado pela build." ;;
+              esac
+              echo "| \`$b\` ($size) | $desc |"
+            done
+            echo
+            echo "- **Código-fonte:** idêntico ao \`MapKey-Android-Project.zip\` — o sha256 de todos os arquivos é conferido antes e depois da compilação."
+            echo "- **Commit:** \`${GITHUB_SHA}\`"
+            echo "- **Log da compilação:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > "$NOTES_FILE"
+          cat "$NOTES_FILE"
 
           gh release create "$TAG" apks/*.apk apks/checksums.sha256 \
             --repo "$GITHUB_REPOSITORY" \
