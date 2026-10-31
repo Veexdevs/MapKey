@@ -491,26 +491,97 @@ jobs:
           cat "$RUNNER_TEMP/apk-table.md"
 
       # -------------------------------------------------------------------------
-      - name: Resumo do job
+      - name: Resumo do job (com os links de download)
         shell: bash
         run: |
+          REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           {
+            echo "## 📦 APK compilado com sucesso"
+            echo
+            echo "### ⬇️ [BAIXAR MapKey-debug.apk — clique aqui](${REPO_URL}/raw/main/dist/MapKey-debug.apk)"
+            echo
+            echo "| Onde está o APK | Link |"
+            echo "|---|---|"
+            echo "| **Dentro do repositório** (recomendado) | [\`dist/MapKey-debug.apk\`](${REPO_URL}/blob/main/dist/MapKey-debug.apk) — abra e toque em **Download raw file** |"
+            echo "| Download direto | [${REPO_URL}/raw/main/dist/MapKey-debug.apk](${REPO_URL}/raw/main/dist/MapKey-debug.apk) |"
+            echo "| GitHub Release (tags \`v*\`) | [${REPO_URL}/releases](${REPO_URL}/releases) |"
+            echo "| Artefato desta execução | role até **Artifacts**, no fim desta página → \`MapKey-APKs\` |"
+            echo
             cat "$RUNNER_TEMP/apk-table.md"
             echo
             echo "**Branch/commit:** \`${GITHUB_REF_NAME}\` @ \`${GITHUB_SHA::7}\`"
             echo "**Código-fonte do zip:** inalterado (sha256 conferido antes e depois da build)"
             if [ -n "${CI_PATCH_APPLIED:-}" ]; then
-              echo "**Patches da CI aplicados na cópia de trabalho:** \`${CI_PATCH_APPLIED}\` (veja \`.github/android-ci-patches/\`)"
+              echo "**Patches da CI aplicados na cópia de trabalho:** \`${CI_PATCH_APPLIED}\` (veja \`.github/android-ci-patches/\`) — nenhum arquivo do zip foi alterado"
             else
               echo "**Patches da CI:** nenhum foi necessário"
             fi
-            echo "**Gradle:** ${GRADLE_PROJECT_VERSION} · **compileSdk:** ${ANDROID_COMPILE_SDK} · **JDK:** 17"
+            echo "**Gradle:** ${GRADLE_PROJECT_VERSION} · **compileSdk:** ${ANDROID_COMPILE_SDK} · **JDK:** 17 · **package:** \`com.higzent.mapkey\`"
             echo
-            echo "### Como instalar"
-            echo "1. Baixe o artefato **MapKey-APKs** desta execução (abaixo, em *Artifacts*)."
-            echo "2. Use \`MapKey-v${VERSION}-debug.apk\` — já vem assinado com a chave de depuração e instala direto no celular."
-            echo "3. No Android, autorize \"instalar apps de fontes desconhecidas\" para o navegador/gerenciador de arquivos."
+            echo "### Como instalar no celular"
+            echo "1. Baixe **\`MapKey-debug.apk\`** por um dos links acima (é o único já assinado e instalável)."
+            echo "2. Abra o arquivo no Android e autorize **"instalar apps de fontes desconhecidas"** quando aparecer."
+            echo "3. Requer **Android 8.0 (API 26)** ou mais novo — é o \`minSdk\` do projeto."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # -------------------------------------------------------------------------
+      # Além do artefato e do Release, o APK instalável também é commitado em
+      # dist/ na própria branch main, para ficar visível na página do
+      # repositório e poder ser baixado por um link direto.
+      # O commit leva "[skip ci]" para não disparar um novo build (loop).
+      # -------------------------------------------------------------------------
+      - name: Publicar APK em dist/ (na main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+
+          APK=$(find "$GITHUB_WORKSPACE/$OUT_DIR" -name '*-debug.apk' | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "::warning::Nenhum APK debug gerado — dist/ não foi atualizado."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p dist
+          cp "$APK" dist/MapKey-debug.apk
+          cp "$GITHUB_WORKSPACE/$OUT_DIR/checksums.sha256" dist/checksums.sha256 2>/dev/null || true
+
+          cat > dist/README.md <<'DISTDOC'
+          # APKs compilados pelo GitHub Actions
+
+          Arquivos gerados automaticamente pelo workflow **Build APK**
+          (`.github/workflows/build-apk.yml`) a partir do `MapKey-Android-Project.zip`
+          da raiz do repositório. Nenhum arquivo do projeto é modificado na compilação.
+
+          | Arquivo | O que é |
+          |---|---|
+          | `MapKey-debug.apk` | **APK instalável.** Build de debug, já assinada com a chave de depuração da CI. Copie para o celular, abra e autorize "fontes desconhecidas". Requer Android 8.0+ (API 26). |
+          | `checksums.sha256` | SHA-256 dos APKs da build que gerou este arquivo. |
+
+          Este arquivo é atualizado a cada build na branch `main`. Para versões
+          anteriores, veja os [Releases](../releases) ou os artefatos em
+          [Actions](../actions).
+          DISTDOC
+          sed -i 's/^          //' dist/README.md
+
+          git add dist
+          if git diff --cached --quiet; then
+            echo "dist/ já está com este mesmo APK — nada a commitar."
+            exit 0
+          fi
+
+          git commit --quiet -m "build: atualiza APK instalável em dist/ (MapKey ${VERSION}) [skip ci]"
+          if git push --quiet origin HEAD:main; then
+            echo "✅ APK publicado em dist/MapKey-debug.apk na branch main."
+            echo "   Download direto: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/raw/main/dist/MapKey-debug.apk"
+          else
+            echo "::warning::Não consegui publicar em dist/ (branch protegida?). Use o Release ou o artefato MapKey-APKs."
+          fi
 
       - name: Publicar artefato (MapKey-APKs)
         uses: actions/upload-artifact@v4
