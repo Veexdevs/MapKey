@@ -548,15 +548,34 @@ jobs:
         run: |
           set -euo pipefail
           ls -lh apks
-          NOTES="APKs do MapKey ${VERSION} compilados automaticamente pelo workflow *Build APK*.
 
-          - \`debug\`: assinado com chave de depuração — instala direto no celular.
-          - \`release\`: para distribuição (assinado se houver keystore nos secrets).
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "APKs do MapKey ${VERSION} compilados automaticamente pelo workflow **Build APK**."
+            echo
+            echo "| Arquivo | Para que serve |"
+            echo "|---|---|"
+            for f in apks/*.apk; do
+              b=$(basename "$f")
+              size=$(du -h "$f" | cut -f1)
+              case "$b" in
+                *debug*)            desc="**Instale este** — já vem assinado com a chave de depuração da build." ;;
+                *release-signed*)   desc="Build release assinada com o keystore cadastrado nos secrets." ;;
+                *release-unsigned*) desc="Build release sem assinatura — assine antes de distribuir." ;;
+                *)                  desc="APK gerado pela build." ;;
+              esac
+              echo "| \`$b\` ($size) | $desc |"
+            done
+            echo
+            echo "- **Código-fonte:** idêntico ao \`MapKey-Android-Project.zip\` — o sha256 de todos os arquivos é conferido antes e depois da compilação."
+            echo "- **Commit:** \`${GITHUB_SHA}\`"
+            echo "- **Log da compilação:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > "$NOTES_FILE"
+          cat "$NOTES_FILE"
 
-          Código-fonte idêntico ao \`MapKey-Android-Project.zip\` do commit ${GITHUB_SHA}."
           gh release create "$TAG" apks/*.apk apks/checksums.sha256 \
             --repo "$GITHUB_REPOSITORY" \
             --title "MapKey ${VERSION}" \
-            --notes "$NOTES" \
+            --notes-file "$NOTES_FILE" \
             || gh release upload "$TAG" apks/*.apk apks/checksums.sha256 \
                  --repo "$GITHUB_REPOSITORY" --clobber
