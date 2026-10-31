@@ -15,6 +15,14 @@
 #   5. publica os APKs como artefato do run — e como GitHub Release quando o
 #      gatilho for uma tag v*.
 #
+# Patch mínimo da CI: o themes.xml do zip declara "MapKeyText.Title",
+# "MapKeyText.Subtitle" e "MapKeyText.SectionLabel" sem atributo parent, então o
+# AAPT2 procura o estilo base "MapKeyText" — que não existe no projeto — e a
+# build morre em "resource style/MapKeyText not found". Como o combinado é não
+# mexer no seu código, o estilo base vazio é adicionado apenas na cópia de
+# trabalho por .github/android-ci-patches/ (zero impacto visual; nenhum arquivo
+# do zip é alterado e o sha256 de todos eles é conferido depois da build).
+#
 # Observação: o zip não inclui o binário "gradle/wrapper/gradle-wrapper.jar"
 # (isso está documentado no README do próprio projeto). Por isso a compilação
 # usa o Gradle instalado pela action oficial, na mesma versão 8.7 apontada pelo
@@ -35,14 +43,9 @@ name: Build APK
 on:
   push:
     branches: ['**']
-    paths:
-      - 'MapKey-Android-Project.zip'
-      - '.github/workflows/build-apk.yml'
+    tags: ['v*']
   pull_request:
     branches: [main]
-    paths:
-      - 'MapKey-Android-Project.zip'
-      - '.github/workflows/build-apk.yml'
   workflow_dispatch:
     inputs:
       variant:
